@@ -4,9 +4,14 @@ package windows
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -30,6 +35,12 @@ func builtin(p *Plugin) catalog.BuiltIn {
 
 func New() *Plugin {
 	p := &Plugin{q: &processQuery{}}
+	systemDir, err := windows.GetSystemDirectory()
+	if err != nil {
+		systemDir = `C:\Windows\System32`
+	}
+	p.servicesExePath = filepath.Join(systemDir, "services.exe")
+	p.findServicesForProcessFn = p.findServicesForProcess
 	return p
 }
 
@@ -37,6 +48,7 @@ type Configuration struct {
 	DiscoverWorkloadPath      bool  `hcl:"discover_workload_path"`
 	WorkloadSizeLimit         int64 `hcl:"workload_size_limit"`
 	DisableGroupNameSelectors bool  `hcl:"disable_group_name_selectors"`
+	EnableServiceDiscovery    bool  `hcl:"enable_service_discovery"`
 }
 
 func buildConfig(coreConfig catalog.CoreConfig, hclText string, status *pluginconf.Status) *Configuration {
@@ -56,17 +68,21 @@ type Plugin struct {
 	mu     sync.Mutex
 	config *Configuration
 
-	log hclog.Logger
-	q   processQueryer
+	log             hclog.Logger
+	q               processQueryer
+	servicesExePath string
+
+	findServicesForProcessFn func(int32, string, processQueryer) ([]serviceInfo, error)
 }
 
 type processInfo struct {
-	pid        int32
-	user       string
-	userSID    string
-	path       string
-	groups     []string
-	groupsSIDs []string
+	pid          int32
+	user         string
+	userSID      string
+	path         string
+	groups       []string
+	groupsSIDs   []string
+	serviceNames []string
 }
 
 func (p *Plugin) SetLogger(log hclog.Logger) {
@@ -93,6 +109,15 @@ func (p *Plugin) Attest(_ context.Context, req *workloadattestorv1.AttestRequest
 		selectorValues = addSelectorValueIfNotEmpty(selectorValues, "group_name", group)
 	}
 
+	seenServiceNames := make(map[string]struct{})
+	for _, serviceName := range process.serviceNames {
+		if _, ok := seenServiceNames[serviceName]; ok {
+			continue
+		}
+		seenServiceNames[serviceName] = struct{}{}
+		selectorValues = addSelectorValueIfNotEmpty(selectorValues, "service_name", serviceName)
+	}
+
 	// obtaining the workload process path and digest are behind a config flag
 	// since it requires the agent to have permissions that might not be
 	// available.
@@ -106,6 +131,27 @@ func (p *Plugin) Attest(_ context.Context, req *workloadattestorv1.AttestRequest
 			}
 
 			selectorValues = append(selectorValues, makeSelectorValue("sha256", sha256Digest))
+		}
+	}
+
+	if config.EnableServiceDiscovery {
+		// Service discovery enriches the token-derived service names with
+		// services found by walking the process tree. A failure here should not
+		// fail attestation because the token-derived selectors are still valid.
+		findServicesForProcess := p.findServicesForProcessFn
+		if findServicesForProcess == nil {
+			findServicesForProcess = p.findServicesForProcess
+		}
+		serviceInfos, err := findServicesForProcess(req.Pid, process.userSID, p.q)
+		if err != nil {
+			p.log.Warn("Unable to discover services for process", telemetry.Error, err)
+		}
+		for _, info := range serviceInfos {
+			if _, ok := seenServiceNames[info.ServiceName]; ok {
+				continue
+			}
+			seenServiceNames[info.ServiceName] = struct{}{}
+			selectorValues = addSelectorValueIfNotEmpty(selectorValues, "service_name", info.ServiceName)
 		}
 	}
 
@@ -169,6 +215,9 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool, disableGroupNames boo
 	}
 	groups := p.q.AllGroups(tokenGroups)
 
+	const allServicesSID = "S-1-5-80-0"
+	const serviceSIDPrefix = "S-1-5-80-"
+
 	start := time.Now()
 	for _, group := range groups {
 		// Each group has a set of attributes that control how
@@ -177,14 +226,31 @@ func (p *Plugin) newProcessInfo(pid int32, queryPath bool, disableGroupNames boo
 		// https://docs.microsoft.com/en-us/windows/win32/secauthz/sid-attributes-in-an-access-token
 		enabledSelector := getGroupEnabledSelector(group.Attributes)
 		processInfo.groupsSIDs = append(processInfo.groupsSIDs, enabledSelector+":"+group.Sid.String())
+		var groupAccount, groupDomain string
 		if !disableGroupNames {
-			groupAccount, groupDomain, err := p.q.LookupAccount(group.Sid)
+			groupAccount, groupDomain, err = p.q.LookupAccount(group.Sid)
 			if err != nil {
 				p.log.Warn("failed to lookup account from group SID", "sid", group.Sid, "error", err)
 				continue
 			}
 			// If the LookupAccount call succeeded, we know that groupAccount is not empty
 			processInfo.groups = append(processInfo.groups, enabledSelector+":"+parseAccount(groupAccount, groupDomain))
+		}
+		// Service SIDs are only meaningful when the SID is enabled. The
+		// all-services SID is a capability SID, not an individual service.
+		if group.Attributes&windows.SE_GROUP_ENABLED != 0 &&
+			strings.HasPrefix(group.Sid.String(), serviceSIDPrefix) &&
+			group.Sid.String() != allServicesSID {
+			// Group name resolution is always needed here to turn the service
+			// SID into a stable service name. This lookup is local.
+			if groupAccount == "" {
+				groupAccount, _, err = p.q.LookupAccount(group.Sid)
+				if err != nil {
+					p.log.Warn("failed to lookup account from group SID", "sid", group.Sid, "error", err)
+					continue
+				}
+			}
+			processInfo.serviceNames = append(processInfo.serviceNames, groupAccount)
 		}
 	}
 	if !disableGroupNames {
@@ -343,4 +409,287 @@ func getGroupEnabledSelector(attributes uint32) string {
 
 func makeSelectorValue(kind, value string) string {
 	return fmt.Sprintf("%s:%s", kind, value)
+}
+
+func (p *Plugin) findServicesForProcess(pid int32, userSID string, q processQueryer) ([]serviceInfo, error) {
+	service := newWindowsService(p.servicesExePath)
+	pidUint32, err := util.CheckedCast[uint32](pid)
+	if err != nil {
+		return nil, err
+	}
+	return service.getServiceInfo(pidUint32, userSID, q)
+}
+
+// service discovery logic
+
+type windowsService struct {
+	servicesExePath string
+}
+
+type serviceInfo struct {
+	ServiceName string
+}
+
+func newWindowsService(servicesExePath string) *windowsService {
+	return &windowsService{servicesExePath: filepath.Clean(servicesExePath)}
+}
+
+func (s *windowsService) getServiceInfo(pid uint32, userSID string, q processQueryer) ([]serviceInfo, error) {
+	servicePID, isService, pidHandle, err := s.serviceGetSCMRegisteredPid(pid, userSID, q)
+	if pidHandle != 0 {
+		defer func() {
+			_ = q.CloseHandle(pidHandle)
+		}()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !isService {
+		return nil, nil
+	}
+
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_ENUMERATE_SERVICE)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open service control manager: %w", err)
+	}
+	defer func(handle windows.Handle) {
+		_ = windows.CloseServiceHandle(handle)
+	}(scm)
+
+	var buffer [4096]byte
+	var bytesNeeded uint32
+	var servicesReturned uint32
+	var resumeHandle uint32
+	var serviceInfos []serviceInfo
+
+	for {
+		err = windows.EnumServicesStatusEx(
+			scm,
+			windows.SC_ENUM_PROCESS_INFO,
+			windows.SERVICE_WIN32,
+			windows.SERVICE_ACTIVE,
+			&buffer[0],
+			uint32(len(buffer)),
+			&bytesNeeded,
+			&servicesReturned,
+			&resumeHandle,
+			nil,
+		)
+		if err != nil && !errors.Is(err, syscall.ERROR_MORE_DATA) {
+			return nil, fmt.Errorf("failed to enumerate services: %w", err)
+		}
+		if errors.Is(err, syscall.ERROR_MORE_DATA) && servicesReturned == 0 {
+			return nil, fmt.Errorf("buffer too small for even a single service entry (need %d bytes)", bytesNeeded)
+		}
+
+		if servicesReturned > 0 {
+			entries := unsafe.Slice((*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buffer[0])), int(servicesReturned))
+			for _, entry := range entries {
+				if entry.ServiceStatusProcess.ProcessId == servicePID {
+					serviceInfos = append(serviceInfos, serviceInfo{
+						ServiceName: windows.UTF16PtrToString(entry.ServiceName),
+					})
+				}
+			}
+		}
+
+		// All services were processed.
+		if err == nil {
+			break
+		}
+	}
+
+	return serviceInfos, nil
+}
+
+var (
+	snapshotProcessesFunc           = snapshotProcesses
+	processCreationTimeFunc         = processCreationTime
+	isProcessSystemServicesRootFunc = func(s *windowsService, pid uint32, process processSnapshotEntry) (bool, error) {
+		return s.isProcessSystemServicesRoot(pid, process)
+	}
+)
+
+func (s *windowsService) serviceGetSCMRegisteredPid(pid uint32, userSID string, q processQueryer) (uint32, bool, windows.Handle, error) {
+	processes, err := snapshotProcessesFunc()
+	if err != nil {
+		return 0, false, 0, err
+	}
+
+	currentPID := pid
+	current, ok := processes[currentPID]
+	if !ok {
+		// Process is already gone; treat it as not being a service.
+		return 0, false, 0, nil
+	}
+
+	currentCreatedAt, err := processCreationTimeFunc(currentPID)
+	if err != nil {
+		return 0, false, 0, fmt.Errorf("failed to read creation time for process %d: %w", currentPID, err)
+	}
+
+	visited := make(map[uint32]bool)
+	visited[currentPID] = true
+	for current.parentPID != 0 {
+		parentPID := current.parentPID
+		parent, ok := processes[parentPID]
+		if !ok {
+			// Parent process is already gone; treat it as not being a service.
+			return 0, false, 0, nil
+		}
+		if visited[parentPID] {
+			return 0, false, 0, fmt.Errorf("cycle detected at parentPid: %d", parentPID)
+		}
+		visited[parentPID] = true
+
+		parentCreatedAt, err := processCreationTimeFunc(parentPID)
+		if err != nil {
+			return 0, false, 0, fmt.Errorf("failed to read creation time for parent process %d: %w", parentPID, err)
+		}
+		if parentCreatedAt > currentCreatedAt {
+			// Parent PID was reused; treat it as not being a service.
+			return 0, false, 0, nil
+		}
+
+		isServices, err := isProcessSystemServicesRootFunc(s, parentPID, parent)
+		if err != nil {
+			return 0, false, 0, err
+		}
+		if isServices {
+			var h windows.Handle
+			// Compare the caller's token user with the token user of the
+			// process being attributed. A descendant is only attributed to the
+			// service when they run under the same user.
+			if currentPID != pid {
+				servicePID, err := util.CheckedCast[int32](currentPID)
+				if err != nil {
+					return 0, false, 0, err
+				}
+				h, err = q.OpenProcess(servicePID)
+				if err != nil {
+					return 0, false, h, err
+				}
+
+				// Keep the process handle open through SCM enumeration so the
+				// PID cannot be reused while the service name is resolved.
+				var token windows.Token
+				if err := q.OpenProcessToken(h, &token); err != nil {
+					return 0, false, h, fmt.Errorf("failed to open the access token associated with the parent process: %w", err)
+				}
+				defer func() {
+					_ = q.CloseProcessToken(token)
+				}()
+
+				tokenUser, err := q.GetTokenUser(&token)
+				if err != nil {
+					return 0, false, h, fmt.Errorf("failed to retrieve user account information from access token: %w", err)
+				}
+				if tokenUser.User.Sid.String() != userSID {
+					return 0, false, h, nil
+				}
+			}
+			return currentPID, true, h, nil
+		}
+
+		currentPID = parentPID
+		current = parent
+		currentCreatedAt = parentCreatedAt
+	}
+
+	return 0, false, 0, nil
+}
+
+func (s *windowsService) isProcessSystemServicesRoot(pid uint32, process processSnapshotEntry) (bool, error) {
+	if !strings.EqualFold(process.exe, "services.exe") {
+		return false, nil
+	}
+
+	var sessionID uint32
+	if err := windows.ProcessIdToSessionId(pid, &sessionID); err != nil {
+		return false, fmt.Errorf("failed to read session id for services.exe candidate pid %d: %w", pid, err)
+	}
+	if sessionID != 0 {
+		return false, nil
+	}
+
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return false, fmt.Errorf("failed to open services.exe candidate pid %d: %w", pid, err)
+	}
+	defer func(handle windows.Handle) {
+		_ = windows.CloseHandle(handle)
+	}(handle)
+
+	imagePath, err := getAbsoluteExePath(handle)
+	if err != nil {
+		return false, fmt.Errorf("failed to read image path for services.exe candidate pid %d: %w", pid, err)
+	}
+
+	return strings.EqualFold(filepath.Clean(imagePath), s.servicesExePath), nil
+}
+
+func getAbsoluteExePath(process windows.Handle) (string, error) {
+	buffer := make([]uint16, windows.MAX_LONG_PATH)
+	size := uint32(windows.MAX_LONG_PATH)
+	if err := windows.QueryFullProcessImageName(process, 0, &buffer[0], &size); err != nil {
+		return "", err
+	}
+	return windows.UTF16ToString(buffer[:size]), nil
+}
+
+type processSnapshotEntry struct {
+	parentPID uint32
+	exe       string
+}
+
+func snapshotProcesses() (map[uint32]processSnapshotEntry, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create process snapshot: %w", err)
+	}
+	defer func(handle windows.Handle) {
+		_ = windows.CloseHandle(handle)
+	}(snapshot)
+
+	processes := make(map[uint32]processSnapshotEntry)
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	if err := windows.Process32First(snapshot, &entry); err != nil {
+		return nil, fmt.Errorf("failed to read first process snapshot entry: %w", err)
+	}
+	for {
+		exe := windows.UTF16ToString(entry.ExeFile[:])
+		processes[entry.ProcessID] = processSnapshotEntry{
+			parentPID: entry.ParentProcessID,
+			exe:       exe,
+		}
+
+		err := windows.Process32Next(snapshot, &entry)
+		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read process snapshot entry: %w", err)
+		}
+	}
+
+	return processes, nil
+}
+
+func processCreationTime(pid uint32) (uint64, error) {
+	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return 0, err
+	}
+	defer func(handle windows.Handle) {
+		_ = windows.CloseHandle(handle)
+	}(process)
+
+	var createdAt, exitedAt, kernelTime, userTime windows.Filetime
+	if err := windows.GetProcessTimes(process, &createdAt, &exitedAt, &kernelTime, &userTime); err != nil {
+		return 0, err
+	}
+
+	return uint64(createdAt.HighDateTime)<<32 | uint64(createdAt.LowDateTime), nil
 }
